@@ -49,7 +49,7 @@ main = do
     Right parsedExpression -> do
       revlinesref <- newIORef []
       putStrLn $ pretty parsedExpression
-      value <- evaluate (\line -> atomicModifyIORef' revlinesref (\x -> (line : x, ()))) (MemorableBindings Map.empty) prelude parsedExpression
+      value <- evaluate myLib (\line -> atomicModifyIORef' revlinesref (\x -> (line : x, ()))) (MemorableBindings Map.empty) prelude parsedExpression
       revlines <- readIORef revlinesref
       writeFile "output.hs" $ unlines
         [ "Program:"
@@ -59,6 +59,9 @@ main = do
         , "Return value:"
         , "=> " ++ prettyV value
         ]
+
+mkBinding :: String -> (MemorableBindings, Expression)
+mkBinding str = (MemorableBindings Map.empty, EValue (PrimitiveValue str))
 
 prelude :: MemorableBindings
 prelude = MemorableBindings $ Map.fromList
@@ -71,33 +74,37 @@ prelude = MemorableBindings $ Map.fromList
   , ("head", (MemorableBindings Map.empty, EValue (PrimitiveValue "head")))
   , ("==", (MemorableBindings Map.empty, EValue (PrimitiveValue "==")))
   , ("+", (MemorableBindings Map.empty, EValue (PrimitiveValue "+")))
-  ]
+  ] `Map.union` Map.mapWithKey (\k _ -> mkBinding k) myLib
 
-preludeDefs :: MonadIO m => Map.Map String (Value -> m Value)
-preludeDefs = Map.fromList
+
+type Lib =  Map.Map String (Value -> IO Value)
+
+myLib :: Lib
+myLib = Map.fromList
   [ ("reverse", (\(StringValue s) -> pure $ StringValue $ reverse s))
   ]
 
-logeval :: MonadIO m => (String -> m ()) -> MemorableBindings -> MemorableBindings -> Expression -> m Value
-logeval out movs@(MemorableBindings ovs) mbs@(MemorableBindings bs) e = do
+logeval :: MonadIO m => Lib -> (String -> m ()) -> MemorableBindings -> MemorableBindings -> Expression -> m Value
+logeval libs out movs@(MemorableBindings ovs) mbs@(MemorableBindings bs) e = do
   --liftIO $ putStrLn $ unwords (Map.keys ovs) ++ " | " ++ unwords (Map.keys bs) ++ " | " ++ pretty e
-  evaluate out movs mbs e
+  evaluate libs out movs mbs e
 
 evaluate :: MonadIO m
-         => (String -> m ())
+         => Lib
+         -> (String -> m ())
          -> MemorableBindings
          -> MemorableBindings
          -> Expression
          -> m Value
-evaluate out ovs (MemorableBindings bs) (Let bindings expression) =
+evaluate libs out ovs (MemorableBindings bs) (Let bindings expression) =
   let bs' = MemorableBindings $ bs `Map.union` (Map.fromList $ map (\(name, expr) -> (name, (MemorableBindings bs, expr))) (Map.toList bindings))
-  in logeval out ovs bs' expression
-evaluate out (MemorableBindings ovs) bs@(MemorableBindings mbs) (Override bindings expression) =
+  in logeval libs out ovs bs' expression
+evaluate libs out (MemorableBindings ovs) bs@(MemorableBindings mbs) (Override bindings expression) =
   let ovs' = MemorableBindings $ ovs `Map.union` (Map.fromList $ map (\(name, (old, expr)) -> (name, (MemorableBindings (Map.insert old (mbs Map.! name) mbs), expr))) (Map.toList bindings))
-  in logeval out ovs' bs expression
-evaluate out ovs bs@(MemorableBindings mbs) (FunctionCall function argument) = do
-  argument' <- logeval out ovs bs argument
-  function' <- logeval out ovs bs function
+  in logeval libs out ovs' bs expression
+evaluate libs out ovs bs@(MemorableBindings mbs) (FunctionCall function argument) = do
+  argument' <- logeval libs out ovs bs argument
+  function' <- logeval libs out ovs bs function
   case (function', argument') of
     (PrimitiveValue "print", StringValue s) -> Unit <$ out s
     (PrimitiveValue "print", other) -> Unit <$ out (prettyV other)
@@ -114,22 +121,25 @@ evaluate out ovs bs@(MemorableBindings mbs) (FunctionCall function argument) = d
     (PrimitiveValue "+", NumberValue num) -> return $ PrimFnValue (\case
       NumberValue v -> NumberValue (num + v)
       other -> error $ "can't add " ++ prettyV other)
-    (Lambda (MemorableBindings lbs) name expr, arg) -> logeval out ovs (MemorableBindings (Map.insert name (bs, EValue arg) (lbs `Map.union` mbs))) expr
+    (Lambda (MemorableBindings lbs) name expr, arg) -> logeval libs out ovs (MemorableBindings (Map.insert name (bs, EValue arg) (lbs `Map.union` mbs))) expr
+    (PrimitiveValue l, r) -> case (libs Map.!? l) of
+      Nothing -> error $ prettyV (PrimitiveValue l) ++ " is not a function"
+      Just f -> liftIO $ f r
     (l, r) -> error $ prettyV l ++ " is not a function"
-evaluate out ovs (MemorableBindings bs) (EValue (Lambda (MemorableBindings lbs) name expression)) = return $ Lambda (MemorableBindings (lbs `Map.union` bs)) name expression
-evaluate out movs@(MemorableBindings ovs) (MemorableBindings bs) (Variable v) = case ovs Map.!? v of
+evaluate libs out ovs (MemorableBindings bs) (EValue (Lambda (MemorableBindings lbs) name expression)) = return $ Lambda (MemorableBindings (lbs `Map.union` bs)) name expression
+evaluate libs out movs@(MemorableBindings ovs) (MemorableBindings bs) (Variable v) = case ovs Map.!? v of
   Nothing -> case bs Map.!? v of
     Nothing -> error $ "unknown name " ++ v
-    Just (bs', expr) -> logeval out movs bs' expr
-  Just (bs', expr) -> logeval out movs bs' expr
-evaluate out ovs bs (Block []) = return Unit
-evaluate out ovs bs (Block [statement]) = logeval out ovs bs statement
-evaluate out ovs bs (Block (statement : rest)) = logeval out ovs bs statement >> logeval out ovs bs (Block rest)
-evaluate out ovs bs (EValue v) = return v
-evaluate out ovs bs (If b e1 e2) = do
-  b' <- logeval out ovs bs b
+    Just (bs', expr) -> logeval libs out movs bs' expr
+  Just (bs', expr) -> logeval libs out movs bs' expr
+evaluate libs out ovs bs (Block []) = return Unit
+evaluate libs out ovs bs (Block [statement]) = logeval libs out ovs bs statement
+evaluate libs out ovs bs (Block (statement : rest)) = logeval libs out ovs bs statement >> logeval libs out ovs bs (Block rest)
+evaluate libs out ovs bs (EValue v) = return v
+evaluate libs out ovs bs (If b e1 e2) = do
+  b' <- logeval libs out ovs bs b
   case b' of
-    (BooleanValue b) -> if b then logeval out ovs bs e1 else logeval out ovs bs e2
+    (BooleanValue b) -> if b then logeval libs out ovs bs e1 else logeval libs out ovs bs e2
     x -> error "The input to the if expression was not a boolean"
 -- evaluate ovs bs o = error $ "unrecognized: " ++ show o
 
@@ -335,7 +345,7 @@ evalFile :: MonadIO m => (String -> m ()) -> FilePath -> m (Either (ParseErrorBu
 evalFile out filename = do
   file <- fmap stripComments $ liftIO $ readFile filename
   let parseResult = parse (expression <* eof) "" file
-  sequence $ evaluate out (MemorableBindings Map.empty) prelude `second` parseResult
+  sequence $ evaluate myLib out (MemorableBindings Map.empty) prelude `second` parseResult
  
 type Test = (FilePath, Value, [String])
 
