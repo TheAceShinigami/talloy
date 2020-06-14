@@ -20,6 +20,9 @@ import Data.Char
 import Rainbow
 import Data.Function
 import Data.IORef
+import Data.Bifunctor (second, first)
+import Data.Traversable (traverse)
+import Control.Monad.IO.Class
 
 type Parser = Parsec Void String
 
@@ -29,7 +32,7 @@ main = do
     Left bundle -> putStr (errorBundlePretty bundle)
     Right parsedExpression -> do
       revlinesref <- newIORef []
-      value <- evaluate (\line -> atomicModifyIORef' revlinesref (\x -> (line : x, ()))) (MemorableBindings Map.empty) prelude parsedExpression
+      value <- evaluate putStrLn (MemorableBindings Map.empty) prelude parsedExpression
       revlines <- readIORef revlinesref
       writeFile "output.hs" $ unlines
         [ "Program:"
@@ -49,12 +52,12 @@ prelude = MemorableBindings $ Map.fromList
   , ("uppercase", (MemorableBindings Map.empty, EValue (PrimitiveValue "uppercase")))
   ]
 
-logeval :: (String -> IO ()) -> MemorableBindings -> MemorableBindings -> Expression -> IO Value
+logeval :: MonadIO m => (String -> m ()) -> MemorableBindings -> MemorableBindings -> Expression -> m Value
 logeval out movs@(MemorableBindings ovs) mbs@(MemorableBindings bs) e = do
   -- putStrLn $ unwords (Map.keys ovs) ++ " | " ++ unwords (Map.keys bs) ++ " | " ++ pretty e
   evaluate out movs mbs e
 
-evaluate :: (String -> IO ()) -> MemorableBindings -> MemorableBindings -> Expression -> IO Value
+evaluate :: MonadIO m => (String -> m ()) -> MemorableBindings -> MemorableBindings -> Expression -> m Value
 evaluate out ovs (MemorableBindings bs) (Let bindings expression) =
   let bs' = MemorableBindings $ bs `Map.union` (Map.fromList $ map (\(name, expr) -> (name, (MemorableBindings bs, expr))) (Map.toList bindings))
   in logeval out ovs bs' expression
@@ -67,7 +70,7 @@ evaluate out ovs bs@(MemorableBindings mbs) (FunctionCall function argument) = d
   case (function', argument') of
     (PrimitiveValue "print", StringValue s) -> Unit <$ out s
     (PrimitiveValue "print", other) -> Unit <$ out (show other)
-    (PrimitiveValue "sleep", NumberValue n) -> Unit <$ threadDelay (floor (n * 10**6))
+    (PrimitiveValue "sleep", NumberValue n) -> Unit <$ (liftIO $ threadDelay (floor (n * 10**6)))
     (PrimitiveValue "sleep", other) -> error "sleep expects a number"
     (PrimitiveValue "uppercase", StringValue s) -> return $ StringValue (map toUpper s)
     (PrimitiveValue "uppercase", other) -> error $ "cannot uppercase " ++ show other
@@ -115,7 +118,7 @@ data Expression =
   | Override (Map String (String, Expression)) Expression
   | If Expression Expression Expression
   | EValue Value
-  deriving (Show)
+  deriving (Show, Eq)
 
 data Value =
     PrimitiveValue String
@@ -124,11 +127,11 @@ data Value =
   | BooleanValue Bool
   | Lambda MemorableBindings String Expression
   | Unit
-  deriving (Show)
+  deriving (Show, Eq)
 
 type PlainBindings = Map String Expression
 
-newtype MemorableBindings = MemorableBindings (Map String (MemorableBindings, Expression)) deriving (Show)
+newtype MemorableBindings = MemorableBindings (Map String (MemorableBindings, Expression)) deriving (Show, Eq)
 
 term :: Parser Expression
 term = choice
@@ -223,6 +226,7 @@ strTok str = string str <* whitespace
 
 -- Mostly taken from
 -- https://stackoverflow.com/questions/12940490/how-would-i-strip-out-comments-from-a-file-with-parsec
+stripComments  :: String -> String
 stripComments s = fromRight $ parse eatComments "" s
   where
     fromRight x = case x of
@@ -242,4 +246,60 @@ stripComments s = fromRight $ parse eatComments "" s
       xs <- sepBy notComment comment
       optional comment
       return $ intercalate "" xs
+
+data Log a = Log { runLog :: IO (a, [String]) }
+instance Functor Log where
+  fmap f (Log l) = Log $ first f <$> l
+
+instance Applicative Log where
+  pure x = Log $ pure (x, [])
+  (Log flog) <*> (Log xlog) = Log $ do
+    (f, log) <- flog
+    (x, log') <- xlog
+    pure ((f x), log' ++ log) 
+
+instance Monad Log where
+  (Log xlog) >>= f = Log $ do
+    (x, log) <- xlog
+    (x', log') <- runLog $ f x
+    pure (x', log' ++ log)
+
+instance MonadIO Log where
+  liftIO x = Log $ x >>= \x' -> pure $ (x', [])
+
+logOut :: String -> Log ()
+logOut str = Log $ pure ((), [str])
+
+getLog :: Log a -> IO [String]
+getLog (Log log) = snd <$> log
+  
+evalFile :: MonadIO m => (String -> m ()) -> FilePath -> m (Either (ParseErrorBundle String Void) Value)
+evalFile out filename = do
+  file <- fmap stripComments $ liftIO $ readFile filename
+  let parseResult = parse (expression <* eof) "" file
+  sequence $ evaluate out (MemorableBindings Map.empty) prelude `second` parseResult
+ 
+type Test = (FilePath, Value, [String])
+
+runTest :: Test -> IO (Either (ParseErrorBundle String Void) Bool)
+runTest (filePath, expectedResult, expectedLog) = do
+  (result, testLog) <- runLog $ evalFile logOut filePath
+  pure $ (&& expectedLog == testLog) . (== expectedResult) <$> result  
+
+printTest :: FilePath -> Log (Either (ParseErrorBundle String Void) Bool) -> Log ()
+printTest filePath getResult = do
+  result <- getResult
+  liftIO $ case result of
+    Left bundle -> putStrLn (errorBundlePretty bundle) 
+    Right True -> putStrLn $ filePath ++ ": PASSED"
+    Right False -> putStrLn $ filePath ++ ": FAILED"
+  
+
+  
+tests :: [Test]
+tests =
+  [ ("tests/example.ty", Unit, ["JOHN DOE"])
+  ]
+  
+runTests = sequence $ printTest . runTest <$> tests
 
