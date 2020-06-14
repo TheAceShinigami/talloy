@@ -25,6 +25,7 @@ import Data.Bifunctor (second, first)
 import Data.Traversable (traverse)
 import Control.Monad.IO.Class
 import Control.Exception (throwIO, ArithException(Overflow))
+import Data.Foldable (fold)
 
 type Parser = Parsec Void String
 
@@ -72,12 +73,22 @@ prelude = MemorableBindings $ Map.fromList
   , ("+", (MemorableBindings Map.empty, EValue (PrimitiveValue "+")))
   ]
 
+preludeDefs :: MonadIO m => Map.Map String (Value -> m Value)
+preludeDefs = Map.fromList
+  [ ("reverse", (\(StringValue s) -> pure $ StringValue $ reverse s))
+  ]
+
 logeval :: MonadIO m => (String -> m ()) -> MemorableBindings -> MemorableBindings -> Expression -> m Value
 logeval out movs@(MemorableBindings ovs) mbs@(MemorableBindings bs) e = do
-  putStrLn $ unwords (Map.keys ovs) ++ " | " ++ unwords (Map.keys bs) ++ " | " ++ pretty e
+  --liftIO $ putStrLn $ unwords (Map.keys ovs) ++ " | " ++ unwords (Map.keys bs) ++ " | " ++ pretty e
   evaluate out movs mbs e
 
-evaluate :: MonadIO m => (String -> m ()) -> MemorableBindings -> MemorableBindings -> Expression -> m Value
+evaluate :: MonadIO m
+         => (String -> m ())
+         -> MemorableBindings
+         -> MemorableBindings
+         -> Expression
+         -> m Value
 evaluate out ovs (MemorableBindings bs) (Let bindings expression) =
   let bs' = MemorableBindings $ bs `Map.union` (Map.fromList $ map (\(name, expr) -> (name, (MemorableBindings bs, expr))) (Map.toList bindings))
   in logeval out ovs bs' expression
@@ -94,7 +105,7 @@ evaluate out ovs bs@(MemorableBindings mbs) (FunctionCall function argument) = d
     (PrimitiveValue "sleep", other) -> error "sleep expects a number"
     (PrimitiveValue "uppercase", StringValue s) -> return $ StringValue (map toUpper s)
     (PrimitiveValue "uppercase", other) -> error $ "cannot uppercase " ++ prettyV other
-    (PrimitiveValue "readFile", StringValue filename) -> StringValue <$> readFile filename
+    (PrimitiveValue "readFile", StringValue filename) -> StringValue <$> (liftIO $ readFile filename)
     (PrimitiveValue "head", StringValue str) -> return $ StringValue [head str]
     (PrimitiveValue "tail", StringValue str) -> return $ StringValue (tail str)
     (PrimitiveValue "null", StringValue str) -> return $ BooleanValue (null str)
@@ -148,7 +159,7 @@ data Expression =
   | Override (Map String (String, Expression)) Expression
   | If Expression Expression Expression
   | EValue Value
-  deriving (Show, Eq)
+  deriving Eq
 
 data Value =
     PrimitiveValue String
@@ -319,7 +330,7 @@ logOut str = Log $ pure ((), [str])
 
 getLog :: Log a -> IO [String]
 getLog (Log log) = snd <$> log
-  
+
 evalFile :: MonadIO m => (String -> m ()) -> FilePath -> m (Either (ParseErrorBundle String Void) Value)
 evalFile out filename = do
   file <- fmap stripComments $ liftIO $ readFile filename
@@ -328,12 +339,15 @@ evalFile out filename = do
  
 type Test = (FilePath, Value, [String])
 
+getTestFilePath :: Test -> FilePath
+getTestFilePath(f, _, _) = f 
+
 runTest :: Test -> IO (Either (ParseErrorBundle String Void) Bool)
 runTest (filePath, expectedResult, expectedLog) = do
   (result, testLog) <- runLog $ evalFile logOut filePath
   pure $ (&& expectedLog == testLog) . (== expectedResult) <$> result  
 
-printTest :: FilePath -> Log (Either (ParseErrorBundle String Void) Bool) -> Log ()
+printTest :: FilePath -> IO (Either (ParseErrorBundle String Void) Bool) -> IO ()
 printTest filePath getResult = do
   result <- getResult
   liftIO $ case result of
@@ -346,6 +360,8 @@ printTest filePath getResult = do
 tests :: [Test]
 tests =
   [ ("tests/example.ty", Unit, ["JOHN DOE"])
+  , ("tests/wc.ty", NumberValue 5, [])
+  , ("tests/map.ty", Unit, ["2", "1"])
   ]
   
-runTests = sequence $ printTest . runTest <$> tests
+runTests = sequence $ (printTest . getTestFilePath <*> runTest) <$> tests
