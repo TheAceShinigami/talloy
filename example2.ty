@@ -1,0 +1,9 @@
+let {
+  wc = \inword -> \str -> if (null str)
+    then 0
+    else (if (head str == " ")
+      then (wc False (tail str))
+      else ((if inword then 0 else 1) + wc True (tail str)));
+}
+in
+  wc False "it began with two words"
